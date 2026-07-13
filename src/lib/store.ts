@@ -156,9 +156,31 @@ const GALLERY_KEY = "trixie_gallery";
 const EMAILS_KEY = "trixie_emails";
 const NOTIFICATIONS_KEY = "trixie_notifications";
 const STORE_UPDATE_EVENT = "trixie-store-update";
+const STORAGE_SYNC_KEYS = [
+  PROJECTS_KEY,
+  POSTS_KEY,
+  LIKES_KEY,
+  POST_LIKES_KEY,
+  SETTINGS_KEY,
+  CONTENT_KEY,
+  MEDIA_KEY,
+  ADVERTISEMENTS_KEY,
+  GALLERY_KEY,
+  EMAILS_KEY,
+  NOTIFICATIONS_KEY,
+];
 
 function emitStoreUpdate() {
   window.dispatchEvent(new Event(STORE_UPDATE_EVENT));
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("storage", (event) => {
+    if (event.storageArea !== localStorage) return;
+    if (event.key === null || STORAGE_SYNC_KEYS.includes(event.key)) {
+      emitStoreUpdate();
+    }
+  });
 }
 
 function nowISO() {
@@ -418,6 +440,7 @@ export function getPosts(): BlogPost[] {
 
 export function savePosts(posts: BlogPost[]) {
   localStorage.setItem(POSTS_KEY, JSON.stringify(posts));
+  emitStoreUpdate();
 }
 
 export function getPublishedPosts(): BlogPost[] {
@@ -839,6 +862,7 @@ export function getSettings(): SiteSettings {
 
 export function saveSettings(settings: SiteSettings) {
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  emitStoreUpdate();
 }
 
 export function getContent(): PageContent {
@@ -850,6 +874,7 @@ export function getContent(): PageContent {
 
 export function saveContent(content: PageContent) {
   localStorage.setItem(CONTENT_KEY, JSON.stringify(content));
+  emitStoreUpdate();
 }
 
 const defaultMedia: MediaContent = {
