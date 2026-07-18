@@ -1,3 +1,5 @@
+import { supabase } from "@/integrations/supabase/client";
+
 export interface CommentReply {
   id: string;
   name: string;
@@ -174,6 +176,28 @@ function emitStoreUpdate() {
   window.dispatchEvent(new Event(STORE_UPDATE_EVENT));
 }
 
+function getStoredArray<T>(key: string): T[] {
+  try {
+    const stored = localStorage.getItem(key);
+    return stored ? JSON.parse(stored) as T[] : [];
+  } catch {
+    return [];
+  }
+}
+
+async function hydrateFromSupabase<T>(key: string, loader: () => Promise<T[]>) {
+  if (typeof window === "undefined") return;
+  try {
+    const remote = await loader();
+    if (remote.length > 0) {
+      localStorage.setItem(key, JSON.stringify(remote));
+      emitStoreUpdate();
+    }
+  } catch {
+    // ignore remote sync failures and fall back to local storage
+  }
+}
+
 if (typeof window !== "undefined") {
   window.addEventListener("storage", (event) => {
     if (event.storageArea !== localStorage) return;
@@ -320,23 +344,92 @@ const defaultEmails: EmailMessage[] = [
 
 const defaultNotifications: Notification[] = [];
 
+function isSupabaseConfigured() {
+  return Boolean(supabase && import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY);
+}
+
+export function normalizeProjectFromSupabase(row: Record<string, unknown>): Project {
+  const tech = Array.isArray(row.tech) ? row.tech.filter((item): item is string => typeof item === "string") : [];
+  return {
+    id: String(row.id ?? crypto.randomUUID()),
+    title: String(row.title ?? "Untitled project"),
+    description: String(row.description ?? ""),
+    tech,
+    image: String((row.thumbnail as string | undefined) ?? ""),
+    thumbnail: String((row.thumbnail as string | undefined) ?? ""),
+    screenshots: Array.isArray(row.screenshots) ? row.screenshots.filter((item): item is string => typeof item === "string") : [],
+    demoVideo: typeof row.demo_video === "string" ? row.demo_video : "",
+    featured: Boolean(row.featured),
+    sortOrder: Number(row.sort_order ?? 0),
+    liveUrl: typeof row.live_url === "string" ? row.live_url : undefined,
+    githubUrl: typeof row.github_url === "string" ? row.github_url : undefined,
+    likes: 0,
+    comments: [],
+    createdAt: typeof row.created_at === "string" ? row.created_at : nowISO(),
+  };
+}
+
+export async function getProjectsFromSupabase(): Promise<Project[]> {
+  if (!isSupabaseConfigured()) return [];
+
+  const { data, error } = await supabase.from("projects").select("*").order("sort_order", { ascending: true });
+  if (error) {
+    console.error("Failed to fetch projects from Supabase", error);
+    return [];
+  }
+
+  return (data ?? []).map((row) => normalizeProjectFromSupabase(row as Record<string, unknown>));
+}
+
+export async function syncProjectsToSupabase(projects: Project[]) {
+  if (!isSupabaseConfigured()) return false;
+
+  const rows = projects.map((project) => ({
+    id: project.id,
+    title: project.title,
+    description: project.description,
+    tech: project.tech,
+    thumbnail: project.image || project.thumbnail || null,
+    screenshots: project.screenshots,
+    demo_video: project.demoVideo || null,
+    github_url: project.githubUrl || null,
+    live_url: project.liveUrl || null,
+    featured: project.featured,
+    sort_order: project.sortOrder,
+    created_at: project.createdAt,
+    updated_at: nowISO(),
+  }));
+
+  const { error } = await supabase.from("projects").upsert(rows, { onConflict: "id" });
+  if (error) {
+    console.error("Failed to sync projects to Supabase", error);
+    return false;
+  }
+
+  return true;
+}
+
 export function getProjects(): Project[] {
   const stored = localStorage.getItem(PROJECTS_KEY);
   if (stored) {
     const projects = JSON.parse(stored) as Project[];
-    return projects.map(p => ({
+    const normalized = projects.map(p => ({
       ...p,
       likes: p.likes ?? 0,
       comments: p.comments?.map(c => ({ ...c, status: c.status ?? "approved", replies: c.replies ?? [] })) ?? [],
     }));
+    void hydrateFromSupabase(PROJECTS_KEY, getProjectsFromSupabase).catch(() => undefined);
+    return normalized;
   }
   localStorage.setItem(PROJECTS_KEY, JSON.stringify(defaultProjects));
+  void hydrateFromSupabase(PROJECTS_KEY, getProjectsFromSupabase).catch(() => undefined);
   return defaultProjects;
 }
 
 export function saveProjects(projects: Project[]) {
   localStorage.setItem(PROJECTS_KEY, JSON.stringify(projects));
   emitStoreUpdate();
+  void syncProjectsToSupabase(projects).catch(() => undefined);
 }
 
 export function addProject(project: Omit<Project, "id" | "createdAt" | "likes" | "comments">) {
@@ -428,19 +521,23 @@ export function getPosts(): BlogPost[] {
   const stored = localStorage.getItem(POSTS_KEY);
   if (stored) {
     const posts = JSON.parse(stored) as BlogPost[];
-    return posts.map(p => ({
+    const normalized = posts.map(p => ({
       ...p,
       likes: p.likes ?? 0,
       comments: p.comments?.map(c => ({ ...c, status: c.status ?? "approved", replies: c.replies ?? [] })) ?? [],
     }));
+    void hydrateFromSupabase(POSTS_KEY, getPostsFromSupabase).catch(() => undefined);
+    return normalized;
   }
   localStorage.setItem(POSTS_KEY, JSON.stringify(defaultPosts));
+  void hydrateFromSupabase(POSTS_KEY, getPostsFromSupabase).catch(() => undefined);
   return defaultPosts;
 }
 
 export function savePosts(posts: BlogPost[]) {
   localStorage.setItem(POSTS_KEY, JSON.stringify(posts));
   emitStoreUpdate();
+  void syncPostsToSupabase(posts).catch(() => undefined);
 }
 
 export function getPublishedPosts(): BlogPost[] {
@@ -449,6 +546,61 @@ export function getPublishedPosts(): BlogPost[] {
 
 export function getDraftPosts(): BlogPost[] {
   return getPosts().filter(post => post.status === "draft");
+}
+
+export function normalizePostFromSupabase(row: Record<string, unknown>): BlogPost {
+  return {
+    id: String(row.id ?? crypto.randomUUID()),
+    title: String(row.title ?? "Untitled post"),
+    content: String(row.content ?? ""),
+    excerpt: typeof row.excerpt === "string" ? row.excerpt : "",
+    tags: Array.isArray(row.tags) ? row.tags.filter((item): item is string => typeof item === "string") : [],
+    featured_image: typeof row.featured_image === "string" ? row.featured_image : undefined,
+    video: typeof row.video === "string" ? row.video : undefined,
+    status: (row.status as PostStatus | undefined) ?? "draft",
+    published_at: typeof row.published_at === "string" ? row.published_at : undefined,
+    likes: 0,
+    comments: [],
+    createdAt: typeof row.created_at === "string" ? row.created_at : nowISO(),
+  };
+}
+
+export async function getPostsFromSupabase(): Promise<BlogPost[]> {
+  if (!isSupabaseConfigured()) return [];
+
+  const { data, error } = await supabase.from("posts").select("*").order("created_at", { ascending: false });
+  if (error) {
+    console.error("Failed to fetch posts from Supabase", error);
+    return [];
+  }
+
+  return (data ?? []).map((row) => normalizePostFromSupabase(row as Record<string, unknown>));
+}
+
+export async function syncPostsToSupabase(posts: BlogPost[]) {
+  if (!isSupabaseConfigured()) return false;
+
+  const rows = posts.map((post) => ({
+    id: post.id,
+    title: post.title,
+    content: post.content,
+    excerpt: post.excerpt,
+    tags: post.tags,
+    featured_image: post.featured_image || null,
+    video: post.video || null,
+    status: post.status,
+    published_at: post.published_at || null,
+    created_at: post.createdAt,
+    updated_at: nowISO(),
+  }));
+
+  const { error } = await supabase.from("posts").upsert(rows, { onConflict: "id" });
+  if (error) {
+    console.error("Failed to sync posts to Supabase", error);
+    return false;
+  }
+
+  return true;
 }
 
 export function addPost(post: Omit<BlogPost, "id" | "createdAt" | "likes" | "comments"> & Partial<Pick<BlogPost, "status" | "published_at">>) {
@@ -565,19 +717,77 @@ export function deletePostComment(postId: string, commentId: string) {
   savePosts(posts);
 }
 
+export function normalizeAdvertisementFromSupabase(row: Record<string, unknown>): Advertisement {
+  return {
+    id: String(row.id ?? crypto.randomUUID()),
+    title: String(row.title ?? "Untitled advertisement"),
+    description: String(row.description ?? ""),
+    media_url: String(row.media_url ?? ""),
+    media_type: (row.media_type as Advertisement["media_type"] | undefined) ?? "image",
+    button_text: String(row.button_text ?? ""),
+    button_link: String(row.button_link ?? ""),
+    enabled: Boolean(row.enabled),
+    sort_order: Number(row.sort_order ?? 0),
+    createdAt: typeof row.created_at === "string" ? row.created_at : nowISO(),
+    updatedAt: typeof row.updated_at === "string" ? row.updated_at : nowISO(),
+  };
+}
+
+export async function getAdvertisementsFromSupabase(): Promise<Advertisement[]> {
+  if (!isSupabaseConfigured()) return [];
+
+  const { data, error } = await supabase.from("advertisements").select("*").order("sort_order", { ascending: true });
+  if (error) {
+    console.error("Failed to fetch advertisements from Supabase", error);
+    return [];
+  }
+
+  return (data ?? []).map((row) => normalizeAdvertisementFromSupabase(row as Record<string, unknown>));
+}
+
+export async function syncAdvertisementsToSupabase(advertisements: Advertisement[]) {
+  if (!isSupabaseConfigured()) return false;
+
+  const rows = advertisements.map((ad) => ({
+    id: ad.id,
+    title: ad.title,
+    description: ad.description,
+    media_url: ad.media_url,
+    media_type: ad.media_type,
+    button_text: ad.button_text,
+    button_link: ad.button_link,
+    enabled: ad.enabled,
+    sort_order: ad.sort_order,
+    created_at: ad.createdAt,
+    updated_at: ad.updatedAt,
+  }));
+
+  const { error } = await supabase.from("advertisements").upsert(rows, { onConflict: "id" });
+  if (error) {
+    console.error("Failed to sync advertisements to Supabase", error);
+    return false;
+  }
+
+  return true;
+}
+
 export function getAdvertisements(): Advertisement[] {
   const stored = localStorage.getItem(ADVERTISEMENTS_KEY);
   if (stored) {
     const adverts = JSON.parse(stored) as Advertisement[];
-    return adverts.sort((a, b) => a.sort_order - b.sort_order);
+    const sorted = adverts.sort((a, b) => a.sort_order - b.sort_order);
+    void hydrateFromSupabase(ADVERTISEMENTS_KEY, getAdvertisementsFromSupabase).catch(() => undefined);
+    return sorted;
   }
   localStorage.setItem(ADVERTISEMENTS_KEY, JSON.stringify(defaultAdvertisements));
+  void hydrateFromSupabase(ADVERTISEMENTS_KEY, getAdvertisementsFromSupabase).catch(() => undefined);
   return defaultAdvertisements;
 }
 
 export function saveAdvertisements(adverts: Advertisement[]) {
   localStorage.setItem(ADVERTISEMENTS_KEY, JSON.stringify(adverts));
   emitStoreUpdate();
+  void syncAdvertisementsToSupabase(adverts).catch(() => undefined);
 }
 
 export function addAdvertisement(ad: Omit<Advertisement, "id" | "createdAt" | "updatedAt">) {
@@ -621,19 +831,73 @@ export function setAdvertisementOrder(id: string, sort_order: number) {
   saveAdvertisements(adverts.sort((a, b) => a.sort_order - b.sort_order));
 }
 
+export function normalizeGalleryItemFromSupabase(row: Record<string, unknown>): GalleryItem {
+  return {
+    id: String(row.id ?? crypto.randomUUID()),
+    media_url: String(row.media_url ?? ""),
+    media_type: (row.media_type as GalleryItem["media_type"] | undefined) ?? "image",
+    caption: String(row.caption ?? ""),
+    description: String(row.description ?? ""),
+    album: String(row.album ?? ""),
+    sort_order: Number(row.sort_order ?? 0),
+    createdAt: typeof row.created_at === "string" ? row.created_at : nowISO(),
+    updatedAt: typeof row.updated_at === "string" ? row.updated_at : nowISO(),
+  };
+}
+
+export async function getGalleryItemsFromSupabase(): Promise<GalleryItem[]> {
+  if (!isSupabaseConfigured()) return [];
+
+  const { data, error } = await supabase.from("gallery_items").select("*").order("sort_order", { ascending: true });
+  if (error) {
+    console.error("Failed to fetch gallery items from Supabase", error);
+    return [];
+  }
+
+  return (data ?? []).map((row) => normalizeGalleryItemFromSupabase(row as Record<string, unknown>));
+}
+
+export async function syncGalleryItemsToSupabase(items: GalleryItem[]) {
+  if (!isSupabaseConfigured()) return false;
+
+  const rows = items.map((item) => ({
+    id: item.id,
+    media_url: item.media_url,
+    media_type: item.media_type,
+    caption: item.caption,
+    description: item.description,
+    album: item.album,
+    sort_order: item.sort_order,
+    created_at: item.createdAt,
+    updated_at: item.updatedAt,
+  }));
+
+  const { error } = await supabase.from("gallery_items").upsert(rows, { onConflict: "id" });
+  if (error) {
+    console.error("Failed to sync gallery items to Supabase", error);
+    return false;
+  }
+
+  return true;
+}
+
 export function getGalleryItems(): GalleryItem[] {
   const stored = localStorage.getItem(GALLERY_KEY);
   if (stored) {
     const items = JSON.parse(stored) as GalleryItem[];
-    return items.sort((a, b) => a.sort_order - b.sort_order);
+    const sorted = items.sort((a, b) => a.sort_order - b.sort_order);
+    void hydrateFromSupabase(GALLERY_KEY, getGalleryItemsFromSupabase).catch(() => undefined);
+    return sorted;
   }
   localStorage.setItem(GALLERY_KEY, JSON.stringify(defaultGallery));
+  void hydrateFromSupabase(GALLERY_KEY, getGalleryItemsFromSupabase).catch(() => undefined);
   return defaultGallery;
 }
 
 export function saveGalleryItems(items: GalleryItem[]) {
   localStorage.setItem(GALLERY_KEY, JSON.stringify(items));
   emitStoreUpdate();
+  void syncGalleryItemsToSupabase(items).catch(() => undefined);
 }
 
 export function addGalleryItem(item: Omit<GalleryItem, "id" | "createdAt" | "updatedAt">) {

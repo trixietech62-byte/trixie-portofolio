@@ -8,25 +8,24 @@ import {
   Video, BarChart3, Download, FileBadge, Bell, Mail,
 } from "lucide-react";
 import {
-  getProjects, addProject, deleteProject, updateProject, approveProjectComment, hideProjectComment, replyToProjectComment,
-  getPublishedPosts, getDraftPosts, getPosts, addPost, deletePost, updatePost, publishPost, unpublishPost,
+  getProjects, getProjectsFromSupabase, addProject, deleteProject, updateProject, approveProjectComment, hideProjectComment, replyToProjectComment,
+  getPublishedPosts, getDraftPosts, getPosts, getPostsFromSupabase, addPost, deletePost, updatePost, publishPost, unpublishPost,
   getSettings, saveSettings,
   getContent, saveContent,
   getMedia, saveMedia,
-  getAdvertisements, saveAdvertisements, addAdvertisement, updateAdvertisement, deleteAdvertisement, toggleAdvertisementEnabled, setAdvertisementOrder,
-  getGalleryItems, saveGalleryItems, addGalleryItem, updateGalleryItem, deleteGalleryItem, setGalleryItemOrder,
+  getAdvertisements, getAdvertisementsFromSupabase, saveAdvertisements, addAdvertisement, updateAdvertisement, deleteAdvertisement, toggleAdvertisementEnabled, setAdvertisementOrder,
+  getGalleryItems, getGalleryItemsFromSupabase, saveGalleryItems, addGalleryItem, updateGalleryItem, deleteGalleryItem, setGalleryItemOrder,
   getEmails, saveEmails, addEmail, updateEmail, deleteEmail, markEmailRead, toggleStarEmail, archiveEmail, moveEmailToTrash, createEmailDraft, sendEmailReply, forwardEmail,
   getNotifications, markNotificationRead, clearNotifications,
   type Project, type BlogPost, type SiteSettings, type PageContent, type MediaContent,
   type Advertisement, type GalleryItem, type EmailMessage, type Notification,
 } from "@/lib/store";
 import { toast } from "sonner";
+import { getSupabaseAuthErrorMessage } from "@/lib/adminAuth";
 
 const STORE_UPDATE_EVENT = "trixie-store-update";
 
 // ─── Admin Login Gate ────────────────────────────────────
-const ADMIN_USER = "trixie";
-const ADMIN_PASS = "5210";
 const AUTH_KEY = "trixie_admin_auth";
 
 function AdminLogin({ onLogin }: { onLogin: () => void }) {
@@ -35,14 +34,31 @@ function AdminLogin({ onLogin }: { onLogin: () => void }) {
   const [showPass, setShowPass] = useState(false);
   const [remember, setRemember] = useState(true);
   const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (username.trim().toLowerCase() === ADMIN_USER && password.trim() === ADMIN_PASS) {
-      sessionStorage.setItem(AUTH_KEY, "true");
-      onLogin();
-    } else {
-      setError("Invalid username or password");
+    setLoading(true);
+    setError("");
+
+    try {
+      const { data, error } = await import("@/integrations/supabase/client").then(({ supabase }) =>
+        supabase.auth.signInWithPassword({ email: username.trim(), password: password.trim() })
+      );
+
+      if (error) {
+        setError(getSupabaseAuthErrorMessage(error));
+        return;
+      }
+
+      if (data.session) {
+        sessionStorage.setItem(AUTH_KEY, "true");
+        onLogin();
+      }
+    } catch (err) {
+      setError(getSupabaseAuthErrorMessage(err));
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -160,9 +176,10 @@ function AdminLogin({ onLogin }: { onLogin: () => void }) {
 
               <button
                 type="submit"
-                className="w-full py-3.5 rounded-xl bg-gradient-to-r from-indigo-500 to-purple-600 hover:from-indigo-400 hover:to-purple-500 text-white font-semibold flex items-center justify-center gap-2 shadow-lg shadow-purple-900/30 transition-all"
+                disabled={loading}
+                className="w-full py-3.5 rounded-xl bg-gradient-to-r from-indigo-500 to-purple-600 hover:from-indigo-400 hover:to-purple-500 text-white font-semibold flex items-center justify-center gap-2 shadow-lg shadow-purple-900/30 transition-all disabled:opacity-70"
               >
-                Sign In
+                {loading ? "Signing in..." : "Sign In"}
                 <ChevronRight className="h-5 w-5" />
               </button>
             </form>
@@ -229,12 +246,27 @@ const inputCls = "w-full bg-secondary border border-border rounded-lg px-4 py-3 
 
 // ─── Dashboard Home ──────────────────────────────────────
 function DashboardHome() {
-  const projects = getProjects();
+  const [projects, setProjects] = useState<Project[]>(() => getProjects());
+  const [isSupabaseConnected, setIsSupabaseConnected] = useState(false);
   const posts = getPublishedPosts();
   const ads = getAdvertisements();
   const gallery = getGalleryItems();
   const emails = getEmails();
   const notifications = getNotifications();
+  useEffect(() => {
+    let cancelled = false;
+    const loadProjects = async () => {
+      const supabaseProjects = await getProjectsFromSupabase();
+      if (!cancelled && supabaseProjects.length > 0) {
+        setProjects(supabaseProjects);
+        setIsSupabaseConnected(true);
+      }
+    };
+    void loadProjects();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   const totalComments = projects.reduce((acc, p) => acc + (p.comments?.length || 0), 0);
   const unreadEmails = emails.filter((email) => email.folder === "inbox" && email.status === "unread").length;
 
@@ -248,7 +280,8 @@ function DashboardHome() {
   return (
     <div>
       <h1 className="text-3xl font-bold mb-2">Welcome back, <span className="gradient-text">Trixie</span></h1>
-      <p className="text-muted-foreground mb-8">Here's what's happening on your site.</p>
+      <p className="text-muted-foreground mb-2">Here's what's happening on your site.</p>
+      {isSupabaseConnected && <p className="text-sm text-emerald-400 mb-6">Supabase is connected for project data.</p>}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
         {stats.map(s => (
           <div key={s.label} className="glass rounded-xl p-5 neon-border">
@@ -293,12 +326,28 @@ function DashboardHome() {
 
 // ─── Posts Manager ───────────────────────────────────────
 function PostsManager() {
-  const [posts, setPosts] = useState<BlogPost[]>(getPosts);
+  const [posts, setPosts] = useState<BlogPost[]>(() => getPosts());
   const [showForm, setShowForm] = useState(false);
+  const [isSupabaseConnected, setIsSupabaseConnected] = useState(false);
   const [title, setTitle] = useState("");
   const [content, setContent] = useState("");
   const [excerpt, setExcerpt] = useState("");
   const [tags, setTags] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadPosts = async () => {
+      const supabasePosts = await getPostsFromSupabase();
+      if (!cancelled && supabasePosts.length > 0) {
+        setPosts(supabasePosts);
+        setIsSupabaseConnected(true);
+      }
+    };
+    void loadPosts();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const handleAdd = () => {
     if (!title.trim() || !content.trim()) { toast.error("Title and content required"); return; }
@@ -316,7 +365,10 @@ function PostsManager() {
   return (
     <div>
       <div className="flex items-center justify-between mb-6">
-        <h1 className="text-2xl font-bold">Blog Posts</h1>
+        <div>
+          <h1 className="text-2xl font-bold">Blog Posts</h1>
+          {isSupabaseConnected && <p className="text-sm text-emerald-400 mt-1">Posts are synced from Supabase.</p>}
+        </div>
         <button onClick={() => setShowForm(!showForm)} className="flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-lg text-sm font-medium hover:neon-glow transition-all">
           <Plus className="h-4 w-4" />{showForm ? "Cancel" : "New Post"}
         </button>
@@ -566,8 +618,24 @@ function CommentsManager() {
 }
 
 function AdvertisementManager() {
-  const [advertisements, setAdvertisements] = useState<Advertisement[]>(getAdvertisements);
+  const [advertisements, setAdvertisements] = useState<Advertisement[]>(() => getAdvertisements());
+  const [isSupabaseConnected, setIsSupabaseConnected] = useState(false);
   const [newAd, setNewAd] = useState({ title: "", description: "", media_url: "", media_type: "image" as "image" | "video", button_text: "Learn More", button_link: "", enabled: true, sort_order: 1 });
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadAdvertisements = async () => {
+      const supabaseAds = await getAdvertisementsFromSupabase();
+      if (!cancelled && supabaseAds.length > 0) {
+        setAdvertisements(supabaseAds);
+        setIsSupabaseConnected(true);
+      }
+    };
+    void loadAdvertisements();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const refresh = () => setAdvertisements(getAdvertisements());
   const handleSave = () => {
@@ -581,7 +649,10 @@ function AdvertisementManager() {
   return (
     <div>
       <div className="flex items-center justify-between mb-6">
-        <h1 className="text-2xl font-bold">Advertisements</h1>
+        <div>
+          <h1 className="text-2xl font-bold">Advertisements</h1>
+          {isSupabaseConnected && <p className="text-sm text-emerald-400 mt-1">Advertisements are synced from Supabase.</p>}
+        </div>
         <button onClick={handleSave} className="flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-lg text-sm font-medium hover:neon-glow transition-all">
           <Plus className="h-4 w-4" /> Add Advertisement
         </button>
@@ -633,8 +704,24 @@ function AdvertisementManager() {
 }
 
 function GalleryManager() {
-  const [galleryItems, setGalleryItems] = useState<GalleryItem[]>(getGalleryItems);
+  const [galleryItems, setGalleryItems] = useState<GalleryItem[]>(() => getGalleryItems());
+  const [isSupabaseConnected, setIsSupabaseConnected] = useState(false);
   const [itemDraft, setItemDraft] = useState({ caption: "", description: "", album: "", media_url: "", media_type: "image" as "image" | "video", sort_order: 1 });
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadGallery = async () => {
+      const supabaseGallery = await getGalleryItemsFromSupabase();
+      if (!cancelled && supabaseGallery.length > 0) {
+        setGalleryItems(supabaseGallery);
+        setIsSupabaseConnected(true);
+      }
+    };
+    void loadGallery();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const refresh = () => setGalleryItems(getGalleryItems());
   const handleSave = () => {
@@ -648,7 +735,10 @@ function GalleryManager() {
   return (
     <div>
       <div className="flex items-center justify-between mb-6">
-        <h1 className="text-2xl font-bold">Gallery</h1>
+        <div>
+          <h1 className="text-2xl font-bold">Gallery</h1>
+          {isSupabaseConnected && <p className="text-sm text-emerald-400 mt-1">Gallery items are synced from Supabase.</p>}
+        </div>
         <button onClick={handleSave} className="flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-lg text-sm font-medium hover:neon-glow transition-all">
           <Plus className="h-4 w-4" /> Add Item
         </button>
@@ -1072,9 +1162,15 @@ export default function Admin() {
   const [collapsed, setCollapsed] = useState(false);
   const [authed, setAuthed] = useState(() => sessionStorage.getItem(AUTH_KEY) === "true");
 
-  const handleLogout = () => {
-    sessionStorage.removeItem(AUTH_KEY);
-    setAuthed(false);
+  const handleLogout = async () => {
+    try {
+      await import("@/integrations/supabase/client").then(({ supabase }) => supabase.auth.signOut());
+    } catch {
+      // ignore sign-out errors and still clear the local session
+    } finally {
+      sessionStorage.removeItem(AUTH_KEY);
+      setAuthed(false);
+    }
   };
 
   if (!authed) {
